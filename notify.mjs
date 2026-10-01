@@ -135,10 +135,18 @@ function readEvents(cfg, apiPath, r) {
   return { events, sha };
 }
 
-function buildPutBody(cfg, events, ev) {
+function buildPutBody(cfg, events, ev, replaceLast) {
   const last = events.length ? events[events.length - 1] : null;
   if (last && last.type === ev.type && last.title === ev.title && last.agent === ev.agent
       && last.dir === ev.dir && last.host === os.hostname()) {
+    if (replaceLast) {
+      const all = events.slice(0, -1).concat(Object.assign({}, last, { t: new Date().toISOString() }));
+      return {
+        message: 'opencode retry touch ' + last.seq,
+        content: Buffer.from(JSON.stringify(all), 'utf8').toString('base64'),
+        encoding: 'base64',
+      };
+    }
     const tLast = Date.parse(last.t);
     if (Number.isFinite(tLast) && Date.now() - tLast < 10000) {
       dbg('dedup: skip (duplicate of seq ' + last.seq + ')');
@@ -170,7 +178,7 @@ function syncSend(job) {
       dbg('syncSend GET failed: ' + g.status);
       return false;
     }
-    const body = buildPutBody(cfg, cur.events, job.data);
+    const body = buildPutBody(cfg, cur.events, job.data, job.replace);
     if (!body) return true;
     if (cur.sha) body.sha = cur.sha;
     const p = curlReq('PUT', apiPath, cfg.token, body);
@@ -194,7 +202,7 @@ function asyncSend(job) {
       warnOnce('GitHub GET failed: ' + r.status + ' ' + r.body.slice(0, 200));
       return false;
     }
-    const body = buildPutBody(cfg, cur.events, job.data);
+    const body = buildPutBody(cfg, cur.events, job.data, job.replace);
     if (!body) {
       job.done = true;
       return true;
@@ -228,11 +236,11 @@ process.on('exit', () => {
   }
 });
 
-function sendToGitHub(type, text, title, agent, dir) {
+function sendToGitHub(type, text, title, agent, dir, replaceLast) {
   const cfg = loadConfig();
-  dbg('sendToGitHub type=' + type + ' title=' + title + ' agent=' + agent + ' dir=' + dir + ' cfg=' + !!cfg);
+  dbg('sendToGitHub type=' + type + ' title=' + title + ' agent=' + agent + ' dir=' + dir + ' replace=' + !!replaceLast + ' cfg=' + !!cfg);
   if (!cfg) return;
-  const job = { cfg, data: { type, text, title, agent, dir } };
+  const job = { cfg, data: { type, text, title, agent, dir }, replace: !!replaceLast };
   pendingWrites.push(job);
   asyncSend(job).then((ok) => {
     const i = pendingWrites.indexOf(job);
@@ -243,10 +251,11 @@ function sendToGitHub(type, text, title, agent, dir) {
 
 let lastSent = {};
 const COOLDOWN_MS = 20000;
-function shouldNotify(type) {
+function shouldNotify(type, title) {
+  const key = type + '|' + (title || '');
   const now = Date.now();
-  if (lastSent[type] && now - lastSent[type] < COOLDOWN_MS) return false;
-  lastSent[type] = now;
+  if (lastSent[key] && now - lastSent[key] < COOLDOWN_MS) return false;
+  lastSent[key] = now;
   return true;
 }
 
@@ -266,6 +275,8 @@ function errText(err) {
 export default function notifyPlugin() {
   const sessions = new Map();
   const pending = new Map();
+  const retryThrottle = {};
+  const RETRY_THROTTLE_MS = 120000;
   dbg('plugin init');
 
   const titleOf = (sid) => (sid ? sessions.get(sid)?.title : undefined);
@@ -290,10 +301,10 @@ export default function notifyPlugin() {
     return parts.length ? parts[parts.length - 1] : '';
   };
 
-  const notify = (type, text, title, agent, dir) => {
+  const notify = (type, text, title, agent, dir, replaceLast) => {
     dbg('notify ' + type + ' title=' + title + ' agent=' + agent + ' dir=' + dir);
-    if (!shouldNotify(type)) return;
-    sendToGitHub(type, text, title, agent, dir);
+    if (!shouldNotify(type, title)) return;
+    sendToGitHub(type, text, title, agent, dir, replaceLast);
   };
 
   return {
@@ -342,6 +353,7 @@ export default function notifyPlugin() {
           const agent = (s.subs && s.subs.length ? s.subs.join('; ') : undefined);
           const dir = dirShort(s.directory);
           sessions.delete(sid);
+          delete retryThrottle[sid];
           if (pending.has(sid)) return;
           pending.set(sid, true);
           setTimeout(() => pending.delete(sid), 3000);
@@ -356,21 +368,37 @@ export default function notifyPlugin() {
           }
           const agent = s && s.subs && s.subs.length ? s.subs.join('; ') : undefined;
           const dir = s ? dirShort(s.directory) : undefined;
+          delete retryThrottle[p.sessionID];
           notify('error', 'Ошибка: ' + errText(p.error).slice(0, 300), titleOf(p.sessionID), agent, dir);
           break;
         }
         case 'session.status': {
-          if (p.status && p.status.type === 'retry') {
-            notify('retry', 'Повтор после сбоя', titleOf(p.sessionID));
+          if (p.status && p.status.type === 'retry' && p.sessionID) {
+            const s = sessions.get(p.sessionID);
+            if (s && s.parentID) return;
+            const now = Date.now();
+            if (retryThrottle[p.sessionID] && now - retryThrottle[p.sessionID] < RETRY_THROTTLE_MS) return;
+            retryThrottle[p.sessionID] = now;
+            const agent = s && s.subs && s.subs.length ? s.subs.join('; ') : undefined;
+            const dir = s ? dirShort(s.directory) : undefined;
+            notify('retry', 'Повтор после сбоя', titleOf(p.sessionID), agent, dir, true);
           }
           break;
         }
         case 'permission.asked': {
+          const sid = p.sessionID;
+          const s = sid ? sessions.get(sid) : undefined;
+          const isSub = !!(s && s.parentID);
+          let title = titleOf(sid);
+          if (isSub) title = subTaskOf(title);
+          const agent = isSub && s.agent ? '@' + String(s.agent) : undefined;
+          const dir = s ? dirShort(s.directory) : undefined;
           const name = p.permission ? String(p.permission) : 'доступы';
           const patterns = Array.isArray(p.patterns) && p.patterns.length
             ? ' (' + p.patterns.slice(0, 3).join(', ') + ')'
             : '';
-          notify('perm', 'Нужны доступы: ' + (name + patterns).slice(0, 200), titleOf(p.sessionID));
+          if (sid) delete retryThrottle[sid];
+          notify('perm', 'Нужны доступы: ' + (name + patterns).slice(0, 200), title, agent, dir);
           break;
         }
       }
