@@ -390,8 +390,13 @@ export default function notifyPlugin() {
           const s = sid ? sessions.get(sid) : undefined;
           const isSub = !!(s && s.parentID);
           let title = titleOf(sid);
-          if (isSub) title = subTaskOf(title);
-          const agent = isSub && s.agent ? '@' + String(s.agent) : undefined;
+          let agent;
+          if (isSub) {
+            const parent = s.parentID ? sessions.get(s.parentID) : undefined;
+            title = (parent && parent.title) || subTaskOf(title);
+            const task = subTaskOf(s.title);
+            agent = [s.agent ? '@' + String(s.agent) : '', task].filter(Boolean).join(': ');
+          }
           const dir = s ? dirShort(s.directory) : undefined;
           const name = p.permission ? String(p.permission) : 'доступы';
           const patterns = Array.isArray(p.patterns) && p.patterns.length
